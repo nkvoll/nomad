@@ -9,7 +9,9 @@ description: |-
 # Job Specification
 
 Jobs can be specified either in [HCL](https://github.com/hashicorp/hcl) or JSON.
-This guide covers the json syntax for submitting jobs to Nomad.
+This guide covers the json syntax for submitting jobs to Nomad. A useful command
+for generating valid JSON versions of HCL jobs is `nomad run -output <job.nomad>`
+which will emit a JSON version of the job.
 
 ## JSON Syntax
 
@@ -83,12 +85,13 @@ Below is an example of a json object that submits a `Periodic` job to Nomad:
               "Resources": {
                 "Networks": [
                   {
+                    "Mbits": 10,
                     "DynamicPorts": [
                       {
                         "Value": 0,
                         "Label": "db"
                       }
-                    ],
+                    ]
                   }
                 ],
                 "IOPS": 0,
@@ -414,13 +417,18 @@ is started.
 
 The `Artifact` object maps supports the following keys:
 
-* `Source` - The path to the artifact to download.
+* `GetterSource` - The path to the artifact to download.
 
-* `Options` - The `options` block allows setting parameters for `go-getter`. An
-  example is given below: 
+* `RelativeDest` - The destination to download the artifact relative the task's
+  directory.
+
+* `GetterOptions` - A `map[string]string` block of options for `go-getter`.
+  Full documentation of supported options are available
+  [here](https://github.com/hashicorp/go-getter/tree/ef5edd3d8f6f482b775199be2f3734fd20e04d4a#protocol-specific-options-1).
+  An example is given below:
 
 ```
-"Options": {
+"GetterOptions": {
     "checksum": "md5:c4aa853ad2215426eb7d70a21922e794",
 
     "aws_access_key_id": "<id>",

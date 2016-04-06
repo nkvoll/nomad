@@ -16,8 +16,8 @@ import (
 
 	docker "github.com/fsouza/go-dockerclient"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-plugin"
-
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
@@ -37,6 +37,10 @@ const (
 	// NoSuchContainerError is returned by the docker daemon if the container
 	// does not exist.
 	NoSuchContainerError = "No such container"
+
+	// The key populated in Node Attributes to indicate presence of the Docker
+	// driver
+	dockerDriverAttr = "driver.docker"
 )
 
 type DockerDriver struct {
@@ -52,6 +56,7 @@ type DockerDriverAuth struct {
 
 type DockerDriverConfig struct {
 	ImageName        string              `mapstructure:"image"`              // Container's Image Name
+	LoadImages       []string            `mapstructure:"load"`               // LoadImage is array of paths to image archive files
 	Command          string              `mapstructure:"command"`            // The Command/Entrypoint to run when the container starts up
 	Args             []string            `mapstructure:"args"`               // The arguments to the Command/Entrypoint
 	IpcMode          string              `mapstructure:"ipc_mode"`           // The IPC mode of the container - host and none
@@ -157,19 +162,23 @@ func (d *DockerDriver) dockerClient() (*docker.Client, error) {
 }
 
 func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[dockerDriverAttr]
+
 	// Initialize docker API client
 	client, err := d.dockerClient()
 	if err != nil {
-		d.logger.Printf("[INFO] driver.docker: failed to initialize client: %s", err)
+		delete(node.Attributes, dockerDriverAttr)
+		if currentlyEnabled {
+			d.logger.Printf("[INFO] driver.docker: failed to initialize client: %s", err)
+		}
 		return false, nil
 	}
 
 	privileged := d.config.ReadBoolDefault("docker.privileged.enabled", false)
 	if privileged {
-		d.logger.Println("[DEBUG] driver.docker: privileged containers are enabled")
 		node.Attributes["docker.privileged.enabled"] = "1"
-	} else {
-		d.logger.Println("[DEBUG] driver.docker: privileged containers are disabled")
 	}
 
 	// This is the first operation taken on the client so we'll try to
@@ -177,12 +186,15 @@ func (d *DockerDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool
 	// Docker isn't available so we'll simply disable the docker driver.
 	env, err := client.Version()
 	if err != nil {
-		d.logger.Printf("[DEBUG] driver.docker: could not connect to docker daemon at %s: %s", client.Endpoint(), err)
+		if currentlyEnabled {
+			d.logger.Printf("[DEBUG] driver.docker: could not connect to docker daemon at %s: %s", client.Endpoint(), err)
+		}
+		delete(node.Attributes, dockerDriverAttr)
 		return false, nil
 	}
-	node.Attributes["driver.docker"] = "1"
-	node.Attributes["driver.docker.version"] = env.Get("Version")
 
+	node.Attributes[dockerDriverAttr] = "1"
+	node.Attributes["driver.docker.version"] = env.Get("Version")
 	return true, nil
 }
 
@@ -224,6 +236,7 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 	config := &docker.Config{
 		Image:    driverConfig.ImageName,
 		Hostname: driverConfig.Hostname,
+		User:     task.User,
 	}
 
 	hostConfig := &docker.HostConfig{
@@ -419,6 +432,102 @@ func (d *DockerDriver) Periodic() (bool, time.Duration) {
 	return true, 15 * time.Second
 }
 
+// createImage creates a docker image either by pulling it from a registry or by
+// loading it from the file system
+func (d *DockerDriver) createImage(driverConfig *DockerDriverConfig, client *docker.Client, taskDir string) error {
+	image := driverConfig.ImageName
+	repo, tag := docker.ParseRepositoryTag(image)
+	if tag == "" {
+		tag = "latest"
+	}
+
+	var dockerImage *docker.Image
+	var err error
+	// We're going to check whether the image is already downloaded. If the tag
+	// is "latest" we have to check for a new version every time so we don't
+	// bother to check and cache the id here. We'll download first, then cache.
+	if tag != "latest" {
+		dockerImage, err = client.InspectImage(image)
+	}
+
+	// Download the image
+	if dockerImage == nil {
+		if len(driverConfig.LoadImages) > 0 {
+			return d.loadImage(driverConfig, client, taskDir)
+		}
+
+		return d.pullImage(driverConfig, client, repo, tag)
+	}
+	return err
+}
+
+// pullImage creates an image by pulling it from a docker registry
+func (d *DockerDriver) pullImage(driverConfig *DockerDriverConfig, client *docker.Client, repo string, tag string) error {
+	pullOptions := docker.PullImageOptions{
+		Repository: repo,
+		Tag:        tag,
+	}
+
+	authOptions := docker.AuthConfiguration{}
+	if len(driverConfig.Auth) != 0 {
+		authOptions = docker.AuthConfiguration{
+			Username:      driverConfig.Auth[0].Username,
+			Password:      driverConfig.Auth[0].Password,
+			Email:         driverConfig.Auth[0].Email,
+			ServerAddress: driverConfig.Auth[0].ServerAddress,
+		}
+	}
+
+	if authConfigFile := d.config.Read("docker.auth.config"); authConfigFile != "" {
+		if f, err := os.Open(authConfigFile); err == nil {
+			defer f.Close()
+			var authConfigurations *docker.AuthConfigurations
+			if authConfigurations, err = docker.NewAuthConfigurations(f); err != nil {
+				return fmt.Errorf("Failed to create docker auth object: %v", err)
+			}
+
+			authConfigurationKey := ""
+			if driverConfig.SSL {
+				authConfigurationKey += "https://"
+			}
+
+			authConfigurationKey += strings.Split(driverConfig.ImageName, "/")[0]
+			if authConfiguration, ok := authConfigurations.Configs[authConfigurationKey]; ok {
+				authOptions = authConfiguration
+			}
+		} else {
+			return fmt.Errorf("Failed to open auth config file: %v, error: %v", authConfigFile, err)
+		}
+	}
+
+	err := client.PullImage(pullOptions, authOptions)
+	if err != nil {
+		d.logger.Printf("[ERR] driver.docker: failed pulling container %s:%s: %s", repo, tag, err)
+		return d.recoverablePullError(err, driverConfig.ImageName)
+	}
+	d.logger.Printf("[DEBUG] driver.docker: docker pull %s:%s succeeded", repo, tag)
+	return nil
+}
+
+// loadImage creates an image by loading it from the file system
+func (d *DockerDriver) loadImage(driverConfig *DockerDriverConfig, client *docker.Client, taskDir string) error {
+	var errors multierror.Error
+	for _, image := range driverConfig.LoadImages {
+		archive := filepath.Join(taskDir, allocdir.TaskLocal, image)
+		d.logger.Printf("[DEBUG] driver.docker: loading image from: %v", archive)
+		f, err := os.Open(archive)
+		if err != nil {
+			errors.Errors = append(errors.Errors, fmt.Errorf("unable to open image archive: %v", err))
+			continue
+		}
+		if err := client.LoadImage(docker.LoadImageOptions{InputStream: f}); err != nil {
+			errors.Errors = append(errors.Errors, err)
+		}
+		f.Close()
+	}
+	return errors.ErrorOrNil()
+}
+
 func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
 	var driverConfig DockerDriverConfig
 	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
@@ -429,23 +538,17 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, err
 	}
 
-	image := driverConfig.ImageName
-
 	if err := driverConfig.Validate(); err != nil {
 		return nil, err
-	}
-	if task.Resources == nil {
-		return nil, fmt.Errorf("Resources are not specified")
-	}
-	if task.Resources.MemoryMB == 0 {
-		return nil, fmt.Errorf("Memory limit cannot be zero")
-	}
-	if task.Resources.CPU == 0 {
-		return nil, fmt.Errorf("CPU limit cannot be zero")
 	}
 
 	cleanupContainer := d.config.ReadBoolDefault("docker.cleanup.container", true)
 	cleanupImage := d.config.ReadBoolDefault("docker.cleanup.image", true)
+
+	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
+	if !ok {
+		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+	}
 
 	// Initialize docker API client
 	client, err := d.dockerClient()
@@ -453,80 +556,17 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		return nil, fmt.Errorf("Failed to connect to docker daemon: %s", err)
 	}
 
-	repo, tag := docker.ParseRepositoryTag(image)
-	// Make sure tag is always explicitly set. We'll default to "latest" if it
-	// isn't, which is the expected behavior.
-	if tag == "" {
-		tag = "latest"
+	if err := d.createImage(&driverConfig, client, taskDir); err != nil {
+		return nil, fmt.Errorf("failed to create image: %v", err)
 	}
 
-	var dockerImage *docker.Image
-	// We're going to check whether the image is already downloaded. If the tag
-	// is "latest" we have to check for a new version every time so we don't
-	// bother to check and cache the id here. We'll download first, then cache.
-	if tag != "latest" {
-		dockerImage, err = client.InspectImage(image)
+	image := driverConfig.ImageName
+	// Now that we have the image we can get the image id
+	dockerImage, err := client.InspectImage(image)
+	if err != nil {
+		d.logger.Printf("[ERR] driver.docker: failed getting image id for %s: %s", image, err)
+		return nil, fmt.Errorf("Failed to determine image id for `%s`: %s", image, err)
 	}
-
-	// Download the image
-	if dockerImage == nil {
-		pullOptions := docker.PullImageOptions{
-			Repository: repo,
-			Tag:        tag,
-		}
-
-		authOptions := docker.AuthConfiguration{}
-		if len(driverConfig.Auth) != 0 {
-			authOptions = docker.AuthConfiguration{
-				Username:      driverConfig.Auth[0].Username,
-				Password:      driverConfig.Auth[0].Password,
-				Email:         driverConfig.Auth[0].Email,
-				ServerAddress: driverConfig.Auth[0].ServerAddress,
-			}
-		}
-
-		if authConfigFile := d.config.Read("docker.auth.config"); authConfigFile != "" {
-			if f, err := os.Open(authConfigFile); err == nil {
-				defer f.Close()
-				var authConfigurations *docker.AuthConfigurations
-				if authConfigurations, err = docker.NewAuthConfigurations(f); err != nil {
-					return nil, fmt.Errorf("Failed to create docker auth object: %v", err)
-				}
-
-				authConfigurationKey := ""
-				if driverConfig.SSL {
-					authConfigurationKey += "https://"
-				}
-
-				authConfigurationKey += strings.Split(driverConfig.ImageName, "/")[0]
-				if authConfiguration, ok := authConfigurations.Configs[authConfigurationKey]; ok {
-					authOptions = authConfiguration
-				}
-			} else {
-				return nil, fmt.Errorf("Failed to open auth config file: %v, error: %v", authConfigFile, err)
-			}
-		}
-
-		err = client.PullImage(pullOptions, authOptions)
-		if err != nil {
-			d.logger.Printf("[ERR] driver.docker: failed pulling container %s:%s: %s", repo, tag, err)
-			return nil, d.recoverablePullError(err, image)
-		}
-		d.logger.Printf("[DEBUG] driver.docker: docker pull %s:%s succeeded", repo, tag)
-
-		// Now that we have the image we can get the image id
-		dockerImage, err = client.InspectImage(image)
-		if err != nil {
-			d.logger.Printf("[ERR] driver.docker: failed getting image id for %s: %s", image, err)
-			return nil, fmt.Errorf("Failed to determine image id for `%s`: %s", image, err)
-		}
-	}
-
-	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
-	if !ok {
-		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
-	}
-
 	d.logger.Printf("[DEBUG] driver.docker: identified image %s as %s", image, dockerImage.ID)
 
 	bin, err := discover.NomadExecutable()
@@ -545,7 +585,9 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 	executorCtx := &executor.ExecutorContext{
 		TaskEnv:        d.taskEnv,
 		Task:           task,
+		Driver:         "docker",
 		AllocDir:       ctx.AllocDir,
+		AllocID:        ctx.AllocID,
 		PortLowerBound: d.config.ClientMinPort,
 		PortUpperBound: d.config.ClientMaxPort,
 	}
@@ -642,6 +684,9 @@ func (d *DockerDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle
 		doneCh:           make(chan struct{}),
 		waitCh:           make(chan *cstructs.WaitResult, 1),
 	}
+	if err := exec.SyncServices(consulContext(d.config, container.ID)); err != nil {
+		d.logger.Printf("[ERR] driver.docker: error registering services with consul for task: %q: %v", task.Name, err)
+	}
 	go h.run()
 	return h, nil
 }
@@ -695,6 +740,9 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 		return nil, err
 	}
 
+	ver, _ := exec.Version()
+	d.logger.Printf("[DEBUG] driver.docker: version of executor: %v", ver.Version)
+
 	// Return a driver handle
 	h := &DockerHandle{
 		client:           client,
@@ -711,6 +759,10 @@ func (d *DockerDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, er
 		doneCh:           make(chan struct{}),
 		waitCh:           make(chan *cstructs.WaitResult, 1),
 	}
+	if err := exec.SyncServices(consulContext(d.config, pid.ContainerID)); err != nil {
+		h.logger.Printf("[ERR] driver.docker: error registering services with consul: %v", err)
+	}
+
 	go h.run()
 	return h, nil
 }
@@ -826,6 +878,11 @@ func (h *DockerHandle) run() {
 	close(h.doneCh)
 	h.waitCh <- cstructs.NewWaitResult(exitCode, 0, err)
 	close(h.waitCh)
+
+	// Remove services
+	if err := h.executor.DeregisterServices(); err != nil {
+		h.logger.Printf("[ERR] driver.docker: error deregistering services: %v", err)
+	}
 
 	// Shutdown the syslog collector
 	if err := h.executor.Exit(); err != nil {

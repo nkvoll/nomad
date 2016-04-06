@@ -460,6 +460,7 @@ func parseTasks(jobName string, taskGroupName string, result *[]*structs.Task, l
 		// Check for invalid keys
 		valid := []string{
 			"driver",
+			"user",
 			"env",
 			"service",
 			"config",
@@ -617,6 +618,7 @@ func parseArtifacts(result *[]*structs.TaskArtifact, list *ast.ObjectList) error
 		valid := []string{
 			"source",
 			"options",
+			"destination",
 		}
 		if err := checkHCLKeys(o.Val, valid); err != nil {
 			return err
@@ -628,6 +630,11 @@ func parseArtifacts(result *[]*structs.TaskArtifact, list *ast.ObjectList) error
 		}
 
 		delete(m, "options")
+
+		// Default to downloading to the local directory.
+		if _, ok := m["destination"]; !ok {
+			m["destination"] = "local/"
+		}
 
 		var ta structs.TaskArtifact
 		if err := mapstructure.WeakDecode(m, &ta); err != nil {
@@ -743,6 +750,8 @@ func parseChecks(service *structs.Service, checkObjs *ast.ObjectList) error {
 			"timeout",
 			"path",
 			"protocol",
+			"command",
+			"args",
 		}
 		if err := checkHCLKeys(co.Val, valid); err != nil {
 			return multierror.Prefix(err, "check ->")

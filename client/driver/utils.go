@@ -12,8 +12,11 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	"github.com/hashicorp/nomad/client/driver/logging"
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
+	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 // createExecutor launches an executor plugin and returns an instance of the
@@ -67,6 +70,27 @@ func createLogCollector(config *plugin.ClientConfig, w io.Writer,
 	}
 	logCollector := raw.(logging.LogCollector)
 	return logCollector, syslogClient, nil
+}
+
+func consulContext(clientConfig *config.Config, containerID string) *executor.ConsulContext {
+	cfg := consul.ConsulConfig{
+		Addr:      clientConfig.ReadDefault("consul.address", "127.0.0.1:8500"),
+		Token:     clientConfig.Read("consul.token"),
+		Auth:      clientConfig.Read("consul.auth"),
+		EnableSSL: clientConfig.ReadBoolDefault("consul.ssl", false),
+		VerifySSL: clientConfig.ReadBoolDefault("consul.verifyssl", true),
+		CAFile:    clientConfig.Read("consul.tls_ca_file"),
+		CertFile:  clientConfig.Read("consul.tls_cert_file"),
+		KeyFile:   clientConfig.Read("consul.tls_key_file"),
+	}
+	return &executor.ConsulContext{
+		ConsulConfig:   &cfg,
+		ContainerID:    containerID,
+		DockerEndpoint: clientConfig.Read("docker.endpoint"),
+		TLSCa:          clientConfig.Read("docker.tls.ca"),
+		TLSCert:        clientConfig.Read("docker.tls.cert"),
+		TLSKey:         clientConfig.Read("docker.tls.key"),
+	}
 }
 
 // killProcess kills a process with the given pid
@@ -145,4 +169,13 @@ func GetAbsolutePath(bin string) (string, error) {
 	}
 
 	return filepath.EvalSymlinks(lp)
+}
+
+// getExecutorUser returns the user of the task, defaulting to
+// cstructs.DefaultUnprivilegedUser if none was given.
+func getExecutorUser(task *structs.Task) string {
+	if task.User == "" {
+		return cstructs.DefaultUnpriviledgedUser
+	}
+	return task.User
 }

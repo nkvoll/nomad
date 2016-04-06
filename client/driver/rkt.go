@@ -39,6 +39,10 @@ const (
 
 	// bytesToMB is the conversion from bytes to megabytes.
 	bytesToMB = 1024 * 1024
+
+	// The key populated in the Node Attributes to indicate the presence of the
+	// Rkt driver
+	rktDriverAttr = "driver.rkt"
 )
 
 // RktDriver is a driver for running images via Rkt
@@ -85,14 +89,22 @@ func NewRktDriver(ctx *DriverContext) Driver {
 }
 
 func (d *RktDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+	// Get the current status so that we can log any debug messages only if the
+	// state changes
+	_, currentlyEnabled := node.Attributes[rktDriverAttr]
+
 	// Only enable if we are root when running on non-windows systems.
 	if runtime.GOOS != "windows" && syscall.Geteuid() != 0 {
-		d.logger.Printf("[DEBUG] driver.rkt: must run as root user, disabling")
+		if currentlyEnabled {
+			d.logger.Printf("[DEBUG] driver.rkt: must run as root user, disabling")
+		}
+		delete(node.Attributes, rktDriverAttr)
 		return false, nil
 	}
 
 	outBytes, err := exec.Command("rkt", "version").Output()
 	if err != nil {
+		delete(node.Attributes, rktDriverAttr)
 		return false, nil
 	}
 	out := strings.TrimSpace(string(outBytes))
@@ -100,10 +112,11 @@ func (d *RktDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 	rktMatches := reRktVersion.FindStringSubmatch(out)
 	appcMatches := reAppcVersion.FindStringSubmatch(out)
 	if len(rktMatches) != 2 || len(appcMatches) != 2 {
+		delete(node.Attributes, rktDriverAttr)
 		return false, fmt.Errorf("Unable to parse Rkt version string: %#v", rktMatches)
 	}
 
-	node.Attributes["driver.rkt"] = "1"
+	node.Attributes[rktDriverAttr] = "1"
 	node.Attributes["driver.rkt.version"] = rktMatches[1]
 	node.Attributes["driver.rkt.appc.version"] = appcMatches[1]
 
@@ -112,7 +125,7 @@ func (d *RktDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 	if currentVersion.LessThan(minVersion) {
 		// Do not allow rkt < 0.14.0
 		d.logger.Printf("[WARN] driver.rkt: please upgrade rkt to a version >= %s", minVersion)
-		node.Attributes["driver.rkt"] = "0"
+		node.Attributes[rktDriverAttr] = "0"
 	}
 	return true, nil
 }
@@ -234,7 +247,9 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 	}
 	executorCtx := &executor.ExecutorContext{
 		TaskEnv:  d.taskEnv,
+		Driver:   "rkt",
 		AllocDir: ctx.AllocDir,
+		AllocID:  ctx.AllocID,
 		Task:     task,
 	}
 
@@ -243,10 +258,14 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, err
 	}
 
-	ps, err := execIntf.LaunchCmd(&executor.ExecCommand{Cmd: absPath, Args: cmdArgs}, executorCtx)
+	ps, err := execIntf.LaunchCmd(&executor.ExecCommand{
+		Cmd:  absPath,
+		Args: cmdArgs,
+		User: task.User,
+	}, executorCtx)
 	if err != nil {
 		pluginClient.Kill()
-		return nil, fmt.Errorf("error starting process via the plugin: %v", err)
+		return nil, err
 	}
 
 	d.logger.Printf("[DEBUG] driver.rkt: started ACI %q with: %v", img, cmdArgs)
@@ -261,6 +280,9 @@ func (d *RktDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		maxKillTimeout: maxKill,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
+	}
+	if h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: error registering services for task: %q: %v", task.Name, err)
 	}
 	go h.run()
 	return h, nil
@@ -277,7 +299,7 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 	pluginConfig := &plugin.ClientConfig{
 		Reattach: id.PluginConfig.PluginConfig(),
 	}
-	executor, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
 	if err != nil {
 		d.logger.Println("[ERROR] driver.rkt: error connecting to plugin so destroying plugin pid and user pid")
 		if e := destroyPlugin(id.PluginConfig.Pid, id.ExecutorPid); e != nil {
@@ -286,19 +308,23 @@ func (d *RktDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 		return nil, fmt.Errorf("error connecting to plugin: %v", err)
 	}
 
+	ver, _ := exec.Version()
+	d.logger.Printf("[DEBUG] driver.rkt: version of executor: %v", ver.Version)
 	// Return a driver handle
 	h := &rktHandle{
 		pluginClient:   pluginClient,
 		executorPid:    id.ExecutorPid,
 		allocDir:       id.AllocDir,
-		executor:       executor,
+		executor:       exec,
 		logger:         d.logger,
 		killTimeout:    id.KillTimeout,
 		maxKillTimeout: id.MaxKillTimeout,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *cstructs.WaitResult, 1),
 	}
-
+	if h.executor.SyncServices(consulContext(d.config, "")); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: error registering services: %v", err)
+	}
 	go h.run()
 	return h, nil
 }
@@ -357,6 +383,11 @@ func (h *rktHandle) run() {
 	}
 	h.waitCh <- cstructs.NewWaitResult(ps.ExitCode, 0, err)
 	close(h.waitCh)
+	// Remove services
+	if err := h.executor.DeregisterServices(); err != nil {
+		h.logger.Printf("[ERR] driver.rkt: failed to deregister services: %v", err)
+	}
+
 	if err := h.executor.Exit(); err != nil {
 		h.logger.Printf("[ERR] driver.rkt: error killing executor: %v", err)
 	}

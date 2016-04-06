@@ -20,7 +20,11 @@ import (
 )
 
 func testLogger() *log.Logger {
-	return log.New(os.Stderr, "", log.LstdFlags)
+	return prefixedTestLogger("")
+}
+
+func prefixedTestLogger(prefix string) *log.Logger {
+	return log.New(os.Stderr, prefix, log.LstdFlags)
 }
 
 type MockTaskStateUpdater struct {
@@ -46,7 +50,6 @@ func testTaskRunnerFromAlloc(restarts bool, alloc *structs.Allocation) (*MockTas
 	conf.AllocDir = os.TempDir()
 	upd := &MockTaskStateUpdater{}
 	task := alloc.Job.TaskGroups[0].Tasks[0]
-	consulClient, _ := NewConsulService(&consulServiceConfig{logger, "127.0.0.1:8500", "", "", false, false, &structs.Node{}})
 	// Initialize the port listing. This should be done by the offer process but
 	// we have a mock so that doesn't happen.
 	task.Resources.Networks[0].ReservedPorts = []structs.Port{{"", 80}}
@@ -55,7 +58,7 @@ func testTaskRunnerFromAlloc(restarts bool, alloc *structs.Allocation) (*MockTas
 	allocDir.Build([]*structs.Task{task})
 
 	ctx := driver.NewExecContext(allocDir, alloc.ID)
-	tr := NewTaskRunner(logger, conf, upd.Update, ctx, alloc, task, consulClient)
+	tr := NewTaskRunner(logger, conf, upd.Update, ctx, alloc, task)
 	if !restarts {
 		tr.restartTracker = noRestartsTracker()
 	}
@@ -65,6 +68,7 @@ func testTaskRunnerFromAlloc(restarts bool, alloc *structs.Allocation) (*MockTas
 func TestTaskRunner_SimpleRun(t *testing.T) {
 	ctestutil.ExecCompatible(t)
 	upd, tr := testTaskRunner(false)
+	tr.MarkReceived()
 	go tr.Run()
 	defer tr.Destroy()
 	defer tr.ctx.AllocDir.Destroy()
@@ -99,6 +103,7 @@ func TestTaskRunner_SimpleRun(t *testing.T) {
 func TestTaskRunner_Destroy(t *testing.T) {
 	ctestutil.ExecCompatible(t)
 	upd, tr := testTaskRunner(true)
+	tr.MarkReceived()
 	defer tr.ctx.AllocDir.Destroy()
 
 	// Change command to ensure we run for a bit
@@ -218,9 +223,8 @@ func TestTaskRunner_SaveRestoreState(t *testing.T) {
 	}
 
 	// Create a new task runner
-	consulClient, _ := NewConsulService(&consulServiceConfig{tr.logger, "127.0.0.1:8500", "", "", false, false, &structs.Node{}})
 	tr2 := NewTaskRunner(tr.logger, tr.config, upd.Update,
-		tr.ctx, tr.alloc, &structs.Task{Name: tr.task.Name}, consulClient)
+		tr.ctx, tr.alloc, &structs.Task{Name: tr.task.Name})
 	if err := tr2.RestoreState(); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -255,6 +259,7 @@ func TestTaskRunner_Download_List(t *testing.T) {
 	task.Artifacts = []*structs.TaskArtifact{&artifact1, &artifact2}
 
 	upd, tr := testTaskRunnerFromAlloc(false, alloc)
+	tr.MarkReceived()
 	go tr.Run()
 	defer tr.Destroy()
 	defer tr.ctx.AllocDir.Destroy()
@@ -319,6 +324,7 @@ func TestTaskRunner_Download_Retries(t *testing.T) {
 	}
 
 	upd, tr := testTaskRunnerFromAlloc(true, alloc)
+	tr.MarkReceived()
 	go tr.Run()
 	defer tr.Destroy()
 	defer tr.ctx.AllocDir.Destroy()
@@ -364,4 +370,30 @@ func TestTaskRunner_Download_Retries(t *testing.T) {
 	if upd.events[6].Type != structs.TaskNotRestarting {
 		t.Fatalf("Seventh Event was %v; want %v", upd.events[6].Type, structs.TaskNotRestarting)
 	}
+}
+
+func TestTaskRunner_Validate_UserEnforcement(t *testing.T) {
+	_, tr := testTaskRunner(false)
+
+	// Try to run as root with exec.
+	tr.task.Driver = "exec"
+	tr.task.User = "root"
+	if err := tr.validateTask(); err == nil {
+		t.Fatalf("expected error running as root with exec")
+	}
+
+	// Try to run a non-blacklisted user with exec.
+	tr.task.Driver = "exec"
+	tr.task.User = "foobar"
+	if err := tr.validateTask(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Try to run as root with docker.
+	tr.task.Driver = "docker"
+	tr.task.User = "root"
+	if err := tr.validateTask(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
 }

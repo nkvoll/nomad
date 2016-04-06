@@ -35,6 +35,12 @@ The following options are available for use in the job specification.
 * `image` - The Docker image to run. The image may include a tag or custom URL and should include `https://` if required.
   By default it will be fetched from Docker Hub.
 
+* `load` - (Optional) A list of paths to image archive files. If
+  this key is not specified, Nomad assumes the `image` is hosted on a repository
+  and attempts to pull the image. The `artifact` blocks can be specified to
+  download each of the archive files. The equivalent of `docker load -i path`
+  would be run on each of the archive files.
+
 * `command` - (Optional) The command to run when starting the container.
 
 *   `args` - (Optional) A list of arguments to the optional `command`. If no
@@ -244,7 +250,8 @@ of the Linux Kernel and Docker daemon.
 
 ## Agent Configuration
 
-The `docker` driver has the following host-level configuration options:
+The `docker` driver has the following [client configuration
+options](/docs/agent/config.html#options):
 
 * `docker.endpoint` - Defaults to `unix:///var/run/docker.sock`. You will need
   to customize this if you use a non-standard socket (http or another
@@ -290,6 +297,17 @@ Note: When testing or using the `-dev` flag you can use `DOCKER_HOST`,
 `DOCKER_TLS_VERIFY`, and `DOCKER_CERT_PATH` to customize Nomad's behavior. If
 `docker.endpoint` is set Nomad will **only** read client configuration from the
 config filie.
+
+An example is given below: 
+
+```
+    client {
+        options = {
+            "docker.cleanup.container" = "false"
+            "docker.cleanup.image" = "false"
+        }
+    }
+```
 
 ## Agent Attributes
 

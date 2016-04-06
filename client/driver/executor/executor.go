@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/shirou/gopsutil/process"
 
 	"github.com/hashicorp/nomad/client/allocdir"
+	"github.com/hashicorp/nomad/client/consul"
 	"github.com/hashicorp/nomad/client/driver/env"
 	"github.com/hashicorp/nomad/client/driver/logging"
 	cstructs "github.com/hashicorp/nomad/client/driver/structs"
@@ -35,6 +37,33 @@ type Executor interface {
 	UpdateLogConfig(logConfig *structs.LogConfig) error
 	UpdateTask(task *structs.Task) error
 	ResourceStats() (*cstructs.TaskResourceStats, error)
+	SyncServices(ctx *ConsulContext) error
+	DeregisterServices() error
+	Version() (*ExecutorVersion, error)
+}
+
+// ConsulContext holds context to configure the consul client and run checks
+type ConsulContext struct {
+	// ConsulConfig is the configuration used to create a consul client
+	ConsulConfig *consul.ConsulConfig
+
+	// ContainerID is the ID of the container
+	ContainerID string
+
+	// TLSCert is the cert which docker client uses while interactng with the docker
+	// daemon over TLS
+	TLSCert string
+
+	// TLSCa is the CA which the docker client uses while interacting with the docker
+	// daeemon over TLS
+	TLSCa string
+
+	// TLSKey is the TLS key which the docker client uses while interacting with
+	// the docker daemon
+	TLSKey string
+
+	// DockerEndpoint is the endpoint of the docker daemon
+	DockerEndpoint string
 }
 
 // ExecutorContext holds context to configure the command user
@@ -49,6 +78,12 @@ type ExecutorContext struct {
 
 	// Task is the task whose executor is being launched
 	Task *structs.Task
+
+	// AllocID is the allocation id to which the task belongs
+	AllocID string
+
+	// Driver is the name of the driver that invoked the executor
+	Driver string
 
 	// PortUpperBound is the upper bound of the ports that we can use to start
 	// the syslog server
@@ -95,6 +130,15 @@ type SyslogServerState struct {
 	Addr            string
 }
 
+// ExecutorVersion is the version of the executor
+type ExecutorVersion struct {
+	Version string
+}
+
+func (v *ExecutorVersion) GoString() string {
+	return v.Version
+}
+
 // UniversalExecutor is an implementation of the Executor which launches and
 // supervises processes. In addition to process supervision it provides resource
 // and file system isolation
@@ -114,10 +158,13 @@ type UniversalExecutor struct {
 	syslogServer *logging.SyslogServer
 	syslogChan   chan *logging.SyslogMessage
 
-	groups *cgroupConfig.Cgroup
-	cgLock sync.Mutex
+	groups  *cgroupConfig.Cgroup
+	cgPaths map[string]string
+	cgLock  sync.Mutex
 
-	logger *log.Logger
+	consulService *consul.ConsulService
+	consulCtx     *ConsulContext
+	logger        *log.Logger
 }
 
 // NewExecutor returns an Executor
@@ -126,6 +173,11 @@ func NewExecutor(logger *log.Logger) Executor {
 		logger:        logger,
 		processExited: make(chan interface{}),
 	}
+}
+
+// Version returns the api version of the executor
+func (e *UniversalExecutor) Version() (*ExecutorVersion, error) {
+	return &ExecutorVersion{Version: "1.0.0"}, nil
 }
 
 // LaunchCmd launches a process and returns it's state. It also configures an
@@ -149,6 +201,7 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand, ctx *ExecutorContext
 
 	// setting the user of the process
 	if command.User != "" {
+		e.logger.Printf("[DEBUG] executor: running command as %s", command.User)
 		if err := e.runAs(command.User); err != nil {
 			return nil, err
 		}
@@ -161,23 +214,42 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand, ctx *ExecutorContext
 	e.cmd.Stdout = e.lro
 	e.cmd.Stderr = e.lre
 
-	// setting the env, path and args for the command
 	e.ctx.TaskEnv.Build()
-	e.cmd.Env = ctx.TaskEnv.EnvList()
-	e.cmd.Path = ctx.TaskEnv.ReplaceEnv(command.Cmd)
-	e.cmd.Args = append([]string{e.cmd.Path}, ctx.TaskEnv.ParseAndReplace(command.Args)...)
 
-	// Ensure that the binary being started is executable.
-	if err := e.makeExecutable(e.cmd.Path); err != nil {
+	// Look up the binary path and make it executable
+	absPath, err := e.lookupBin(ctx.TaskEnv.ReplaceEnv(command.Cmd))
+	if err != nil {
 		return nil, err
 	}
 
-	// starting the process
+	if err := e.makeExecutable(absPath); err != nil {
+		return nil, err
+	}
+
+	// Determine the path to run as it may have to be relative to the chroot.
+	path := absPath
+	if e.command.FSIsolation {
+		rel, err := filepath.Rel(e.taskDir, absPath)
+		if err != nil {
+			return nil, err
+		}
+		path = rel
+	}
+
+	// Set the commands arguments
+	e.cmd.Path = path
+	e.cmd.Args = append([]string{path}, ctx.TaskEnv.ParseAndReplace(command.Args)...)
+	e.cmd.Env = ctx.TaskEnv.EnvList()
+
+	// Start the process
 	if err := e.cmd.Start(); err != nil {
-		return nil, fmt.Errorf("error starting command: %v", err)
+		return nil, err
+	}
+	if err := e.applyLimits(e.cmd.Process.Pid); err != nil {
+		return nil, err
 	}
 	go e.wait()
-	ic := &cstructs.IsolationConfig{Cgroup: e.groups}
+	ic := &cstructs.IsolationConfig{Cgroup: e.groups, CgroupPaths: e.cgPaths}
 	return &ProcessState{Pid: e.cmd.Process.Pid, ExitCode: -1, IsolationConfig: ic, Time: time.Now()}, nil
 }
 
@@ -240,23 +312,36 @@ func (e *UniversalExecutor) UpdateTask(task *structs.Task) error {
 	e.lro.FileSize = fileSize
 	e.lre.MaxFiles = task.LogConfig.MaxFiles
 	e.lre.FileSize = fileSize
+
+	// Re-syncing task with consul service
+	if e.consulService != nil {
+		if err := e.consulService.SyncTask(task); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (e *UniversalExecutor) wait() {
 	defer close(e.processExited)
 	err := e.cmd.Wait()
+	ic := &cstructs.IsolationConfig{Cgroup: e.groups, CgroupPaths: e.cgPaths}
 	if err == nil {
-		e.exitState = &ProcessState{Pid: 0, ExitCode: 0, Time: time.Now()}
+		e.exitState = &ProcessState{Pid: 0, ExitCode: 0, IsolationConfig: ic, Time: time.Now()}
 		return
 	}
 	exitCode := 1
+	var signal int
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			exitCode = status.ExitStatus()
+			if status.Signaled() {
+				signal = int(status.Signal())
+				exitCode = 128 + signal
+			}
 		}
 	}
-	e.exitState = &ProcessState{Pid: 0, ExitCode: exitCode, Time: time.Now()}
+	e.exitState = &ProcessState{Pid: 0, ExitCode: exitCode, Signal: signal, IsolationConfig: ic, Time: time.Now()}
 }
 
 var (
@@ -293,7 +378,7 @@ func (e *UniversalExecutor) Exit() error {
 	}
 	if e.command != nil && e.command.ResourceLimits {
 		e.cgLock.Lock()
-		if err := DestroyCgroup(e.groups); err != nil {
+		if err := DestroyCgroup(e.groups, e.cgPaths); err != nil {
 			merr.Errors = append(merr.Errors, err)
 		}
 		e.cgLock.Unlock()
@@ -339,6 +424,33 @@ func (e *UniversalExecutor) ResourceStats() (*cstructs.TaskResourceStats, error)
 	return stats, nil
 }
 
+func (e *UniversalExecutor) SyncServices(ctx *ConsulContext) error {
+	e.logger.Printf("[INFO] executor: registering services")
+	e.consulCtx = ctx
+	if e.consulService == nil {
+		cs, err := consul.NewConsulService(ctx.ConsulConfig, e.logger, e.ctx.AllocID)
+		if err != nil {
+			return err
+		}
+		cs.SetDelegatedChecks(e.createCheckMap(), e.createCheck)
+		e.consulService = cs
+	}
+	if e.ctx != nil {
+		e.interpolateServices(e.ctx.Task)
+	}
+	err := e.consulService.SyncTask(e.ctx.Task)
+	go e.consulService.PeriodicSync()
+	return err
+}
+
+func (e *UniversalExecutor) DeregisterServices() error {
+	e.logger.Printf("[INFO] executor: de-registering services and shutting down consul service")
+	if e.consulService != nil {
+		return e.consulService.Shutdown()
+	}
+	return nil
+}
+
 // configureTaskDir sets the task dir in the executor
 func (e *UniversalExecutor) configureTaskDir() error {
 	taskDir, ok := e.ctx.AllocDir.TaskDirs[e.ctx.Task.Name]
@@ -350,8 +462,36 @@ func (e *UniversalExecutor) configureTaskDir() error {
 	return nil
 }
 
-// makeExecutablePosix makes the given file executable for root,group,others.
-func (e *UniversalExecutor) makeExecutablePosix(binPath string) error {
+// lookupBin looks for path to the binary to run by looking for the binary in
+// the following locations, in-order: task/local/, task/, based on host $PATH.
+// The return path is absolute.
+func (e *UniversalExecutor) lookupBin(bin string) (string, error) {
+	// Check in the local directory
+	local := filepath.Join(e.taskDir, allocdir.TaskLocal, bin)
+	if _, err := os.Stat(local); err == nil {
+		return local, nil
+	}
+
+	// Check at the root of the task's directory
+	root := filepath.Join(e.taskDir, bin)
+	if _, err := os.Stat(root); err == nil {
+		return root, nil
+	}
+
+	// Check the $PATH
+	if host, err := exec.LookPath(bin); err == nil {
+		return host, nil
+	}
+
+	return "", fmt.Errorf("binary %q could not be found", bin)
+}
+
+// makeExecutable makes the given file executable for root,group,others.
+func (e *UniversalExecutor) makeExecutable(binPath string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
 	fi, err := os.Stat(binPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -414,4 +554,59 @@ func (e *UniversalExecutor) listenerUnix() (net.Listener, error) {
 	}
 
 	return net.Listen("unix", path)
+}
+
+// createCheckMap creates a map of checks that the executor will handle on it's
+// own
+func (e *UniversalExecutor) createCheckMap() map[string]struct{} {
+	checks := map[string]struct{}{
+		"script": struct{}{},
+	}
+	return checks
+}
+
+// createCheck creates NomadCheck from a ServiceCheck
+func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID string) (consul.Check, error) {
+	if check.Type == structs.ServiceCheckScript && e.ctx.Driver == "docker" {
+		return &DockerScriptCheck{
+			id:          checkID,
+			interval:    check.Interval,
+			containerID: e.consulCtx.ContainerID,
+			logger:      e.logger,
+			cmd:         check.Command,
+			args:        check.Args,
+		}, nil
+	}
+
+	if check.Type == structs.ServiceCheckScript && e.ctx.Driver == "exec" {
+		return &ExecScriptCheck{
+			id:          checkID,
+			interval:    check.Interval,
+			cmd:         check.Command,
+			args:        check.Args,
+			taskDir:     e.taskDir,
+			FSIsolation: e.command.FSIsolation,
+		}, nil
+
+	}
+	return nil, fmt.Errorf("couldn't create check for %v", check.Name)
+}
+
+// interpolateServices interpolates tags in a service and checks with values from the
+// task's environment.
+func (e *UniversalExecutor) interpolateServices(task *structs.Task) {
+	e.ctx.TaskEnv.Build()
+	for _, service := range task.Services {
+		for _, check := range service.Checks {
+			if check.Type == structs.ServiceCheckScript {
+				check.Name = e.ctx.TaskEnv.ReplaceEnv(check.Name)
+				check.Command = e.ctx.TaskEnv.ReplaceEnv(check.Command)
+				check.Args = e.ctx.TaskEnv.ParseAndReplace(check.Args)
+				check.Path = e.ctx.TaskEnv.ReplaceEnv(check.Path)
+				check.Protocol = e.ctx.TaskEnv.ReplaceEnv(check.Protocol)
+			}
+		}
+		service.Name = e.ctx.TaskEnv.ReplaceEnv(service.Name)
+		service.Tags = e.ctx.TaskEnv.ParseAndReplace(service.Tags)
+	}
 }

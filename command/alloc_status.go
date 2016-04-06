@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/client"
 )
 
 type AllocStatusCommand struct {
@@ -126,13 +127,21 @@ func (c *AllocStatusCommand) Run(args []string) int {
 		fmt.Sprintf("Node ID|%s", limit(alloc.NodeID, length)),
 		fmt.Sprintf("Job ID|%s", alloc.JobID),
 		fmt.Sprintf("Client Status|%s", alloc.ClientStatus),
-		fmt.Sprintf("Evaluated Nodes|%d", alloc.Metrics.NodesEvaluated),
-		fmt.Sprintf("Filtered Nodes|%d", alloc.Metrics.NodesFiltered),
-		fmt.Sprintf("Exhausted Nodes|%d", alloc.Metrics.NodesExhausted),
-		fmt.Sprintf("Allocation Time|%s", alloc.Metrics.AllocationTime),
-		fmt.Sprintf("Failures|%d", alloc.Metrics.CoalescedFailures),
+	}
+
+	if verbose {
+		basic = append(basic,
+			fmt.Sprintf("Evaluated Nodes|%d", alloc.Metrics.NodesEvaluated),
+			fmt.Sprintf("Filtered Nodes|%d", alloc.Metrics.NodesFiltered),
+			fmt.Sprintf("Exhausted Nodes|%d", alloc.Metrics.NodesExhausted),
+			fmt.Sprintf("Allocation Time|%s", alloc.Metrics.AllocationTime),
+			fmt.Sprintf("Failures|%d", alloc.Metrics.CoalescedFailures))
 	}
 	c.Ui.Output(formatKV(basic))
+
+	if !short {
+		c.taskResources(alloc)
+	}
 
 	// Print the state of each task.
 	if short {
@@ -142,12 +151,9 @@ func (c *AllocStatusCommand) Run(args []string) int {
 	}
 
 	// Format the detailed status
-	c.Ui.Output("\n==> Status")
-	dumpAllocStatus(c.Ui, alloc, length)
-
-	if !short {
-		c.Ui.Output("\n==> Task Resources")
-		c.taskResources(alloc)
+	if verbose || alloc.DesiredStatus == "failed" {
+		c.Ui.Output("\n==> Status")
+		dumpAllocStatus(c.Ui, alloc, length)
 	}
 
 	return 0
@@ -158,7 +164,6 @@ func (c *AllocStatusCommand) shortTaskStatus(alloc *api.Allocation) {
 	tasks := make([]string, 0, len(alloc.TaskStates)+1)
 	tasks = append(tasks, "Name|State|Last Event|Time")
 	for task := range c.sortedTaskStateIterator(alloc.TaskStates) {
-		fmt.Println(task)
 		state := alloc.TaskStates[task]
 		lastState := state.State
 		var lastEvent, lastTime string
@@ -196,6 +201,12 @@ func (c *AllocStatusCommand) taskStatus(alloc *api.Allocation) {
 				desc = "Task started by client"
 			case api.TaskReceived:
 				desc = "Task received by client"
+			case api.TaskFailedValidation:
+				if event.ValidationError != "" {
+					desc = event.ValidationError
+				} else {
+					desc = "Validation of task failed"
+				}
 			case api.TaskDriverFailure:
 				if event.DriverError != "" {
 					desc = event.DriverError
@@ -229,9 +240,18 @@ func (c *AllocStatusCommand) taskStatus(alloc *api.Allocation) {
 				}
 				desc = strings.Join(parts, ", ")
 			case api.TaskRestarting:
-				desc = fmt.Sprintf("Task restarting in %v", time.Duration(event.StartDelay))
+				in := fmt.Sprintf("Task restarting in %v", time.Duration(event.StartDelay))
+				if event.RestartReason != "" && event.RestartReason != client.ReasonWithinPolicy {
+					desc = fmt.Sprintf("%s - %s", event.RestartReason, in)
+				} else {
+					desc = in
+				}
 			case api.TaskNotRestarting:
-				desc = "Task exceeded restart policy"
+				if event.RestartReason != "" {
+					desc = event.RestartReason
+				} else {
+					desc = "Task exceeded restart policy"
+				}
 			}
 
 			// Reverse order so we are sorted by time
@@ -283,6 +303,11 @@ func (c *AllocStatusCommand) allocResources(alloc *api.Allocation) {
 
 // taskResources prints out the tasks current resource usage
 func (c *AllocStatusCommand) taskResources(alloc *api.Allocation) {
+	if len(alloc.TaskResources) == 0 {
+		return
+	}
+
+	c.Ui.Output("\n==> Task Resources")
 	firstLine := true
 	for task, resource := range alloc.TaskResources {
 		header := fmt.Sprintf("\nTask: %q", task)
